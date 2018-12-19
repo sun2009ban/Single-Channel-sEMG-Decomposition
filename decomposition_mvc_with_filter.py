@@ -8,48 +8,77 @@ import Model as Model
 import matplotlib.pyplot as plt
 import copy
 import os
+#import Optimizer_predictive_Adams as Optimizer
+import Optimizer_SGD as Optimizer
+import visdom
+
 '''
 这个new的分解方法是针对新的数据，mvc, open, close, rest 都是一大推的
+加入predictive adams，特别适合优化这种鞍点saddle point问题
 '''
 SAVE_DIR = './saveDecomposition_mvc'
 
-RESTORE_PREVIOUS_MODEL = False
-DEVICE = torch.device('cuda:3')
+RESTORE_PREVIOUS_MODEL = True
+DEVICE = torch.device('cuda')
 DTYPE = torch.float
+
+VIS = visdom.Visdom(env='MVC')
+NB_PLOTS = 3 # 在visdom中plot的MUAPs的数目
+
 DATA_DIMS = 512
-GEN_SEARCH_NUM = 64
+GEN_SEARCH_NUM = 3
 NOISE_DIMS = 100
 NGF = 64
 NDF = 64 
 
-LEARNING_RATE_z = 0.002
-LEARNING_RATE_A = 0.002
+LEARNING_RATE_z = 0.01
+LEARNING_RATE_A = 0.001
+LAMBDA = 1
 LAMBDA_1 = 0.1 # 用来控制到底是产生的数据真实和拟合的权重
-LAMBDA_2 = 0.5
+LAMBDA_2 = 0 # penalty for A
 
-EPOCHS = 1000
+EPOCHS = 50000
 SAVE_EVERY = 1000
-PLOT_GRAD_EVERY = 100
+PLOT_EVERY = 100
 
 DECREASE_LR = 100
-UPDATE_A_EVERY = 1
-UPDATE_z_EVERY = 10
+UPDATE_A_EVERY = 20 #20
+UPDATE_z_EVERY = 1 #1
 
+GAUSSIAN_NOISE = False
+
+# FIR滤波器
+coeff_matrix_np = Filter.fir_filter_matrix(DATA_DIMS, 100, 1000)
+coeff_matrix = torch.from_numpy(coeff_matrix_np)
+coeff_matrix = coeff_matrix.to(DEVICE, DTYPE)
+
+# 读取数据
+'''
 EMG = np.load('./EMG_for_decomposition/trial2_data_dict.npy') # 需要分解的肌肉电信号
 EMG = EMG.item()
 EMG_mvc = copy.copy(EMG['mvc'])
+EMG_mvc = EMG_mvc[:10] # 减小一点EMG_mvc的数目
+'''
 
-for i, mvc in enumerate(EMG_mvc):
-    EMG_mvc[i] = Filter.butter_highpass_filter(mvc, 100, 1000) # 高通滤波，截止频率100，采样率1000
+EMG = np.load('./EMG_for_decomposition/S002/S00201_resample.npy')
+EMG = np.squeeze(EMG)
+#EMG = EMG[0:5120]
+#EMG_mvc = np.reshape(EMG, (10, DATA_DIMS))
+EMG = EMG[0:512 * 1]
+EMG_mvc = np.reshape(EMG, (1, DATA_DIMS))
+
+# 归一化 [-1,1]
+EMG_mvc_max = np.max(EMG_mvc.flatten())
+EMG_mvc_min = np.min(EMG_mvc.flatten())
+EMG_mvc = (EMG_mvc - EMG_mvc_min) / (EMG_mvc_max - EMG_mvc_min) # [0, 1]
+EMG_mvc = (EMG_mvc - 0.5) * 2
+
+EMG_mvc = np.matmul(EMG_mvc, coeff_matrix_np)
 
 EMG_mvc = torch.from_numpy(EMG_mvc)
 EMG_mvc = EMG_mvc.to(DEVICE, DTYPE)
 batch_size = EMG_mvc.shape[0]
 
-# FIR滤波器
-coeff_matrix = Filter.fir_filter_matrix(DATA_DIMS, 100, 1000)
-coeff_matrix = torch.from_numpy(coeff_matrix)
-coeff_matrix = coeff_matrix.to(DEVICE, DTYPE)
 
 # variable 输入噪声z，混合矩阵A， 考虑梯度
 if RESTORE_PREVIOUS_MODEL:
@@ -58,16 +87,22 @@ if RESTORE_PREVIOUS_MODEL:
     z = checkpoint['z']
     A = checkpoint['A']
 else:
-    z = torch.randn(GEN_SEARCH_NUM, NOISE_DIMS, 1, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    if GAUSSIAN_NOISE:
+        z = torch.randn(GEN_SEARCH_NUM, NOISE_DIMS, 1, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    else:
+        z = np.random.uniform(-1, 1, (GEN_SEARCH_NUM, NOISE_DIMS, 1))
+        z = torch.tensor(z, requires_grad=True, device=DEVICE, dtype=DTYPE)
+    
     A = torch.randn(batch_size, GEN_SEARCH_NUM, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    #A = torch.ones(batch_size, GEN_SEARCH_NUM, device=DEVICE, dtype=DTYPE, requires_grad=True)
 
 G_DC = Model.build_dc_generator(ngf=NGF, noise_dims=NOISE_DIMS)
-G_DC.load_state_dict(torch.load('./saveTorch/G_DC.pth'))
+G_DC.load_state_dict(torch.load('./saveTorch/G_DC_46_0.pth', map_location='cuda'))
 G_DC = G_DC.to(DEVICE, DTYPE)
 G_DC.eval()
 
 D_DC = Model.build_dc_classifier(ndf=NDF)
-D_DC.load_state_dict(torch.load('./saveTorch/D_DC.pth'))
+D_DC.load_state_dict(torch.load('./saveTorch/D_DC_46_0.pth', map_location='cuda'))
 D_DC = D_DC.to(DEVICE, DTYPE)
 D_DC.eval()
 
@@ -82,44 +117,32 @@ for p in D_DC.parameters():
 mseloss = torch.nn.MSELoss(size_average=False)
 l1loss = torch.nn.L1Loss(size_average=False)
 
-logits_func = torch.nn.Sigmoid()
-
-# 用来存储梯度grad的变化的
 z_vel = torch.zeros_like(z)
 A_vel = torch.zeros_like(A)
 
 for epoch in range(EPOCHS):
     
     MUAPs = G_DC(z)
-
+    MUAPs = torch.matmul(MUAPs, coeff_matrix) # 对每个MUAPs进行100Hz的高通滤波
     MUAPs_logits = D_DC(MUAPs)
-    MUAPs_logits = logits_func(MUAPs_logits)
 
     MUAPs = torch.squeeze(MUAPs)
     if GEN_SEARCH_NUM == 1:
         MUAPs = torch.unsqueeze(MUAPs, 0)
 
-    MUAPs = torch.matmul(MUAPs, coeff_matrix) # 对每个MUAPs进行100Hz的高通滤波
+    reconstruct_EMG = torch.matmul(A, MUAPs) #debug torch.abs
 
-    reconstruct_EMG = torch.matmul(A, MUAPs) #
-    penalty_A = l1loss(A - torch.mean(A, 0), torch.zeros_like(A))
-    #reconstruct_EMG = reconstruct_EMG.repeat((batch_size, 1))
-    
-    #loss = mseloss(reconstruct_EMG, EMG_mvc) + LAMBDA_1 * torch.mean(MUAPs_logits) + LAMBDA_2 * penalty_A
-    loss = l1loss(reconstruct_EMG, EMG_mvc) + + LAMBDA_1 * torch.mean(MUAPs_logits)
+    if batch_size > 1:
+        penalty_A = torch.mean(torch.std(A, dim=0)) - torch.mean(torch.abs(A)) # 第一项希望A尽可能相同，第二项希望A的值不要是零
+        #loss = LAMBDA * mseloss(reconstruct_EMG, EMG_mvc) - LAMBDA_1 * torch.mean(MUAPs_logits) + LAMBDA_2 * penalty_A
+        loss = LAMBDA * l1loss(reconstruct_EMG, EMG_mvc) - LAMBDA_1 * torch.mean(MUAPs_logits) + LAMBDA_2 * penalty_A
+    else:
+        penalty_A = - torch.mean(torch.abs(A)) # 希望A的值越大越好
+        #loss = LAMBDA * mseloss(reconstruct_EMG, EMG_mvc) - LAMBDA_1 * torch.mean(MUAPs_logits) + LAMBDA_2 * penalty_A
+        loss = LAMBDA * l1loss(reconstruct_EMG, EMG_mvc) - LAMBDA_1 * torch.mean(MUAPs_logits) + LAMBDA_2 * penalty_A
+
     loss.backward()
-
-    # 减小learning rate
-    '''
-    if (epoch + 1) > 3000:
-        LEARNING_RATE_A = LEARNING_RATE_A * 0.1
-    elif (epoch + 1) > 3500:
-        LEARNING_RATE_A = LEARNING_RATE_A * 0.1
-    elif (epoch + 1) > 4000:
-        LEARNING_RATE_A = LEARNING_RATE_A * 0.1
-    '''
-
-    epsilon = 0.000001
+    epsilon = 0.0001
 
     with torch.no_grad():
 
@@ -127,22 +150,32 @@ for epoch in range(EPOCHS):
             z_grad = LEARNING_RATE_z * z.grad / (z.grad.data.norm(2) + epsilon)
             z -= z_grad + 0.5 * z_vel
             z_vel.data = z_grad.data
-
-        # A 的更新频率要慢一些
+            if not GAUSSIAN_NOISE:
+                z_np = z.data.cpu().numpy()
+                z_np = np.clip(z_np, -1, 1)
+                z_tensor = torch.tensor(z_np, device=DEVICE, dtype=DTYPE)
+                z.data = z_tensor
 
         if epoch % UPDATE_A_EVERY == 0:
             A_grad = LEARNING_RATE_A * A.grad / (A.grad.data.norm(2) + epsilon)
-            A -= A_grad + 0.5 * A_vel
+            #A -= A_grad + 0.5 * A_vel
             A_vel.data = A_grad.data
 
-        # 把grad的值显示出来，方便调试            
-        if (epoch + 1) % PLOT_GRAD_EVERY == 0:
-            print('z grad:', torch.mean(torch.abs(z.grad / (z.grad.data.norm(2) + epsilon)  )).item())
-            print('A grad:', torch.mean(torch.abs(A.grad / (A.grad.data.norm(2) + epsilon) )).item())
-            print('Epoch: ', epoch, 'Loss: ', loss.item())
+        z.grad.zero_()
+        A.grad.zero_()
+    if (epoch + 1) % PLOT_EVERY == 0:
+        print('Epoch: ', epoch, 'Loss: ', loss.item())
+        
+        # 输出 orignal 和 reconstruct来看
+        VIS.line(X=np.arange(batch_size * DATA_DIMS), Y=EMG_mvc.view(-1), win='EMG', name='original')
+        VIS.line(X=np.arange(batch_size * DATA_DIMS), Y=reconstruct_EMG.view(-1), win='EMG', name='reconstruct', update='append')
 
-    z.grad.zero_()
-    A.grad.zero_()
+        # 输出 MUAPTs来看
+        assert GEN_SEARCH_NUM >= NB_PLOTS, "Note that replace=False, GEN_SEARCH_NUM >= NB_PLOTS"
+        random_choice = np.random.choice(GEN_SEARCH_NUM, NB_PLOTS, replace=False)
+        average_A = torch.mean(A, dim=0)
+        for i, index in enumerate(random_choice):
+            VIS.line(X=np.arange(DATA_DIMS), Y=MUAPs[index] * average_A[index], win='MUAPT' + str(i), name='MUAPs' + str(i))
 
     if epoch % SAVE_EVERY == 0:
         np.save(os.path.join(SAVE_DIR, 'original_EMG.npy'), EMG_mvc.cpu().data.numpy())
@@ -151,6 +184,7 @@ for epoch in range(EPOCHS):
         np.save(os.path.join(SAVE_DIR, 'z.npy'), z.cpu().data.numpy())
         np.save(os.path.join(SAVE_DIR, 'A.npy'), A.cpu().data.numpy())
 
-# 保存结果
-results = {'z':z, 'A':A}
-torch.save(results, os.path.join(SAVE_DIR, 'checkpoint.tar'))
+        # 保存结果
+        results = {'z':z, 'A':A}
+        torch.save(results, os.path.join(SAVE_DIR, 'checkpoint.tar'))
+
