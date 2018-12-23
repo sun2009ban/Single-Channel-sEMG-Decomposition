@@ -55,6 +55,8 @@ GRADIENT_CLIP = False
 # 生成数据
 GEN_SEARCH_NUM = 512
 GEN_NUM = 32
+GAUSSIAN_NOISE = False
+
 
 DEVICE = torch.device("cuda") # 指定显卡号
 DTYPE = torch.float
@@ -90,7 +92,7 @@ coeff_matrix = torch.from_numpy(coeff_matrix)
 coeff_matrix = coeff_matrix.to(DEVICE, DTYPE)
 
 # 训练模型
-Train.train_dc_gan(train_dataset, D_DC, G_DC, D_DC_optim, G_DC_optim, Loss.discriminator_loss, Loss.generator_loss, filter=coeff_matrix, show_every=SHOW_EVERY, noise_size=NOISE_DIMS, gaussian_noise=False, num_epochs=NUM_EPOCHS,
+Train.train_dc_gan(train_dataset, D_DC, G_DC, D_DC_optim, G_DC_optim, Loss.discriminator_loss, Loss.generator_loss, filter=coeff_matrix, show_every=SHOW_EVERY, noise_size=NOISE_DIMS, gaussian_noise=GAUSSIAN_NOISE, num_epochs=NUM_EPOCHS,
     d_every=D_EVERY, g_every=G_EVERY, save_every=SAVE_EVERY, add_noise=ADD_NOISE, noise_amp=NOISE_AMP, gradient_penalty=GRADIENT_PENALTY, use_memory=USE_MEMORY, memory=MEMORY, gradient_clip=GRADIENT_CLIP, device=DEVICE,
     dtype=DTYPE, save_dir=SAVE_DIR, save_output_dir=SAVE_OUTPUT_DIR, use_visdom=False)
 
@@ -100,8 +102,12 @@ torch.save(D_DC.state_dict(), os.path.join(SAVE_DIR, 'D_DC.pth'))
 torch.save(G_DC.state_dict(), os.path.join(SAVE_DIR, 'G_DC.pth'))
 
 # 任意输出64个由噪音产生的数据
-noise = torch.randn(GEN_SEARCH_NUM, NOISE_DIMS, 1)
-noise = noise.to(DEVICE, DTYPE)
+if GAUSSIAN_NOISE:
+    noise = torch.randn(GEN_SEARCH_NUM, NOISE_DIMS, 1, requires_grad=True, device=DEVICE, dtype=DTYPE)
+else:
+    noise = np.random.uniform(-1, 1, (GEN_SEARCH_NUM, NOISE_DIMS, 1))
+    noise = torch.tensor(noise, requires_grad=True, device=DEVICE, dtype=DTYPE)
+
 fake_data = G_DC(noise)
 fake_data = torch.matmul(fake_data, coeff_matrix) 
 scores = D_DC(fake_data).data
