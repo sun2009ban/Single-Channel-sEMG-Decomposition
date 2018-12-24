@@ -1,0 +1,5 @@
+real data: 
+alpha: 2.197179355115, loc: 62.06766342892597, scale: 20.262601822068433
+
+fake data:
+alpha: 8.0, loc: 4.95, scale: 13.06

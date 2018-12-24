@@ -1,0 +1,5 @@
+*.npy
+*.png
+*.pth
+*.tar
+*.zip
