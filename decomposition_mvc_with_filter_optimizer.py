@@ -23,27 +23,30 @@ DEVICE = torch.device('cuda')
 DTYPE = torch.float
 
 VIS = visdom.Visdom(env='MVC')
-NB_PLOTS = 3 # 在visdom中plot的MUAPs的数目
+NB_PLOTS = 1 # 在visdom中plot的MUAPs的数目
 
 DATA_DIMS = 512
-GEN_SEARCH_NUM = 3
+GEN_SEARCH_NUM = 1 
 NOISE_DIMS = 100
 NGF = 64
 NDF = 64 
 
 LEARNING_RATE_z = 0.0001
-LEARNING_RATE_A = 0.00001
-LAMBDA = 1
-LAMBDA_1 = 0.1 # 用来控制到底是产生的数据真实和拟合的权重
-LAMBDA_2 = 0 # penalty for A
+LEARNING_RATE_A = 0.0001
+LAMBDA = 0.03
+LAMBDA_1 = 1 #2 # 用来控制到底是产生的数据真实和拟合的权重
+LAMBDA_2 = 0 #0.1 # penalty for A
 
-EPOCHS = 50000
+EPOCHS = 500000
 SAVE_EVERY = 1000
 PLOT_EVERY = 100
 
 DECREASE_LR = 100
 UPDATE_A_EVERY = 20 #20
 UPDATE_z_EVERY = 1 #1
+
+GAUSSIAN_NOISE = False
+USE_ABS = True
 
 # FIR滤波器
 coeff_matrix_np = Filter.fir_filter_matrix(DATA_DIMS, 100, 1000)
@@ -85,17 +88,23 @@ if RESTORE_PREVIOUS_MODEL:
     z = checkpoint['z']
     A = checkpoint['A']
 else:
-    z = torch.randn(GEN_SEARCH_NUM, NOISE_DIMS, 1, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    if GAUSSIAN_NOISE:
+        z = torch.randn(GEN_SEARCH_NUM, NOISE_DIMS, 1, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    else:
+        z = np.random.uniform(-1, 1, (GEN_SEARCH_NUM, NOISE_DIMS, 1))
+        z = torch.tensor(z, requires_grad=True, device=DEVICE, dtype=DTYPE)
+    
     #A = torch.randn(batch_size, GEN_SEARCH_NUM, device=DEVICE, dtype=DTYPE, requires_grad=True)
-    A = torch.ones(batch_size, GEN_SEARCH_NUM, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    A = -np.ones((batch_size, GEN_SEARCH_NUM))
+    A = torch.tensor(A, device=DEVICE, dtype=DTYPE, requires_grad=True)
 
 G_DC = Model.build_dc_generator(ngf=NGF, noise_dims=NOISE_DIMS)
-G_DC.load_state_dict(torch.load('./saveTorch/G_DC_39_0_S002.pth', map_location='cuda'))
+G_DC.load_state_dict(torch.load('./saveTorch/G_DC_90_0.pth', map_location='cuda'))
 G_DC = G_DC.to(DEVICE, DTYPE)
 G_DC.eval()
 
 D_DC = Model.build_dc_classifier(ndf=NDF)
-D_DC.load_state_dict(torch.load('./saveTorch/D_DC_39_0_S002.pth', map_location='cuda'))
+D_DC.load_state_dict(torch.load('./saveTorch/D_DC_90_0.pth', map_location='cuda'))
 D_DC = D_DC.to(DEVICE, DTYPE)
 D_DC.eval()
 
@@ -122,7 +131,10 @@ for epoch in range(EPOCHS):
     if GEN_SEARCH_NUM == 1:
         MUAPs = torch.unsqueeze(MUAPs, 0)
 
-    reconstruct_EMG = torch.matmul(A, MUAPs) #debug torch.abs
+    if USE_ABS:
+        reconstruct_EMG = torch.matmul(A, MUAPs) # torch.abs    
+    else:
+        reconstruct_EMG = torch.matmul(A, MUAPs)
 
     if batch_size > 1:
         penalty_A = torch.mean(torch.std(A, dim=0)) - torch.mean(torch.abs(A)) # 第一项希望A尽可能相同，第二项希望A的值不要是零
@@ -139,11 +151,17 @@ for epoch in range(EPOCHS):
 
     if epoch % UPDATE_z_EVERY == 0:
         optim_z.step()
+        if not GAUSSIAN_NOISE:
+            with torch.no_grad():
+                # clamp z to [-1, 1] 不能直接用torch.clamp，会导致梯度消失，不知道为啥
+                z_np = z.data.cpu().numpy()
+                z_np = np.clip(z_np, -1, 1)
+                z_tensor = torch.tensor(z_np, device=DEVICE, dtype=DTYPE)
+                z.data = z_tensor
 
     if epoch % UPDATE_A_EVERY == 0:
-        #optim_A.step()
-        pass
-
+        optim_A.step()
+        
         # 把grad的值显示出来，方便调试            
     if (epoch + 1) % PLOT_EVERY == 0:
         print('Epoch: ', epoch, 'Loss: ', loss.item())
@@ -155,6 +173,7 @@ for epoch in range(EPOCHS):
         # 输出 MUAPTs来看
         assert GEN_SEARCH_NUM >= NB_PLOTS, "Note that replace=False, GEN_SEARCH_NUM >= NB_PLOTS"
         random_choice = np.random.choice(GEN_SEARCH_NUM, NB_PLOTS, replace=False)
+        random_choice = np.sort(random_choice)
         average_A = torch.mean(A, dim=0)
         for i, index in enumerate(random_choice):
             VIS.line(X=np.arange(DATA_DIMS), Y=MUAPs[index] * average_A[index], win='MUAPT' + str(i), name='MUAPs' + str(i))
